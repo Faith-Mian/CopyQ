@@ -1,0 +1,184 @@
+name: CopyQ AppImage (aarch64)
+
+# 在 GitHub 官方 ARM64 runner 上原生构建 CopyQ 的 aarch64 AppImage。
+# 用法：Actions -> 本工作流 -> Run workflow（可指定 ref，默认 v16.0.0）
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'CopyQ 源码 tag / 分支 / commit'
+        required: true
+        default: 'v16.0.0'
+      with_native_notifications:
+        description: '启用 KF6 原生通知（Ubuntu 24.04 缺 KF6 包，默认关闭）'
+        required: false
+        default: false
+        type: boolean
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: copyq-appimage-aarch64-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # linuxdeploy 工具链：这三个仓库都提供官方 aarch64 AppImage
+  LINUXDEPLOY_VERSION: '1-alpha-20251107-1'
+  LINUXDEPLOY_PLUGIN_VERSION: '1-alpha-20250213-1'
+  MINIAUDIO_VERSION: '0.11.25'
+
+jobs:
+  build:
+    name: Build AppImage (aarch64)
+    # GitHub 官方 ARM64 runner。公开仓库免费且不限时长；私有仓库也可用（2026-01 起），但消耗额度。
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+        with:
+          # 若把这个 workflow 放在任意空仓库里（非 CopyQ 的 fork），
+          # 取消下面这行的注释即可直接构建上游源码：
+          # repository: hluk/CopyQ
+          ref: ${{ inputs.ref || github.ref_name }}
+          fetch-depth: 0      # CMake 用 git describe 生成版本串，需要完整历史
+          filter: blob:none
+          submodules: false
+          persist-credentials: false
+
+      - name: 开启 ccache
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03 # v1.2.23
+        with:
+          key: copyq-aarch64-appimage
+
+      - name: 安装构建依赖
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -e
+          for i in 1 2 3 4; do sudo apt-get update -y && break; sleep 15; done
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build extra-cmake-modules git pkg-config \
+            libxfixes-dev libxtst-dev libwayland-dev libegl-dev \
+            qt6-base-dev qt6-base-dev-tools qt6-base-private-dev \
+            qt6-tools-dev qt6-tools-dev-tools qt6-l10n-tools qt6-declarative-dev \
+            libqt6svg6-dev libqt6svg6 libqt6waylandclient6 \
+            qt6-wayland qt6-wayland-dev qt6-wayland-dev-tools \
+            libqca-qt6-dev libqca-qt6-2 libqca-qt6-plugins \
+            qtkeychain-qt6-dev \
+            wget ca-certificates libfuse2t64 file xvfb
+          ${{ inputs.with_native_notifications && 'sudo apt-get install -y --no-install-recommends libkf6notifications-dev kf6-kstatusnotifieritem-dev libkf6guiaddons-dev' || 'echo "跳过 KF6 包（原生通知关闭）"' }}
+
+      - name: 下载 miniaudio 单头文件
+        run: |
+          curl -sSLo src/miniaudio.h \
+            "https://raw.githubusercontent.com/mackron/miniaudio/${MINIAUDIO_VERSION}/miniaudio.h"
+          ls -l src/miniaudio.h
+
+      - name: 配置并编译
+        run: |
+          cmake --preset AppImage-Release \
+            -DCMAKE_CXX_COMPILER=g++ \
+            -DWITH_NATIVE_NOTIFICATIONS=${{ inputs.with_native_notifications && 'ON' || 'OFF' }}
+          cmake --build --preset AppImage-Release
+
+      - name: 取得版本号
+        id: version
+        run: |
+          version="$(git describe --tags --always | sed 's/^v//')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "构建版本: $version"
+
+      - name: 准备 linuxdeploy 工具链（aarch64）
+        run: |
+          set -e
+          dest="$HOME/.local/bin"
+          mkdir -p "$dest"
+          base_ld="https://github.com/linuxdeploy/linuxdeploy/releases/download/${LINUXDEPLOY_VERSION}"
+          base_qt="https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/${LINUXDEPLOY_PLUGIN_VERSION}"
+          base_ai="https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/${LINUXDEPLOY_PLUGIN_VERSION}"
+
+          wget -q -O "$dest/linuxdeploy"              "$base_ld/linuxdeploy-aarch64.AppImage"
+          wget -q -O "$dest/linuxdeploy-plugin-qt"    "$base_qt/linuxdeploy-plugin-qt-aarch64.AppImage"
+          wget -q -O "$dest/linuxdeploy-plugin-appimage" "$base_ai/linuxdeploy-plugin-appimage-aarch64.AppImage"
+
+          chmod +x "$dest"/linuxdeploy*
+          echo "$dest" >> "$GITHUB_PATH"
+
+          # 兜底：runner 内核若不支持 FUSE 挂载，直接解包运行
+          echo "APPIMAGE_EXTRACT_AND_RUN=1" >> "$GITHUB_ENV"
+
+      - name: 打包 AppImage
+        env:
+          DESTDIR: ${{ github.workspace }}/AppDir
+          EXTRA_QT_MODULES: svg;tls
+          EXTRA_PLATFORM_PLUGINS: libqwayland.so
+          QMAKE: qmake6
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -e
+          DESTDIR="$DESTDIR" cmake --install build/copyq/AppImage-Release
+
+          # linuxdeploy-plugin-qt 不会自动识别的插件目录，手动塞进去
+          qt_plugins="$(qmake6 -query QT_INSTALL_PLUGINS)"
+          deps_only_flags=()
+          for dir in \
+              kf6/kwindowsystem \
+              wayland-shell-integration \
+              wayland-decoration-client \
+              wayland-graphics-integration-client \
+          ; do
+              src="$qt_plugins/$dir"
+              dst="$DESTDIR/usr/plugins/$dir"
+              if [ -d "$src" ]; then
+                  mkdir -p "$dst"
+                  cp -a "$src"/*.so "$dst/"
+                  deps_only_flags+=(--deploy-deps-only "$dst")
+              fi
+          done
+
+          # QCA ossl 插件（标签页加密用）
+          mkdir -p "$DESTDIR/usr/plugins/crypto"
+          qca_ossl=$(find /usr/lib /usr/lib64 /usr/lib/aarch64-linux-gnu \
+              -name 'libqca-ossl.so' -print -quit 2>/dev/null)
+          if [ -z "$qca_ossl" ]; then
+              echo "::warning::未找到 libqca-ossl.so（加密标签功能可能不可用）"
+          else
+              echo "找到 QCA ossl 插件: $qca_ossl"
+              cp -a "$qca_ossl" "$DESTDIR/usr/plugins/crypto/"
+              deps_only_flags+=(--deploy-deps-only "$DESTDIR/usr/plugins/crypto")
+          fi
+
+          linuxdeploy --appdir "$DESTDIR" \
+            --desktop-file "$DESTDIR/usr/share/applications/com.github.hluk.copyq.desktop" \
+            --icon-file "$DESTDIR/usr/share/icons/hicolor/scalable/apps/copyq.svg" \
+            --executable "$DESTDIR/usr/bin/copyq" \
+            "${deps_only_flags[@]}" \
+            --plugin qt \
+            --output appimage
+
+      - name: 校验产物
+        id: artifact
+        run: |
+          set -e
+          appimage="$(ls CopyQ-*-aarch64.AppImage | head -n1)"
+          file "$appimage"
+          du -h "$appimage"
+          echo "name=$appimage" >> "$GITHUB_OUTPUT"
+
+      - name: 冒烟测试
+        continue-on-error: true
+        run: |
+          chmod +x "${{ steps.artifact.outputs.name }}"
+          xvfb-run -a "./${{ steps.artifact.outputs.name }}" --version || \
+            "./${{ steps.artifact.outputs.name }}" --version
+
+      - name: 上传产物
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: CopyQ-aarch64-AppImage
+          path: CopyQ-*.AppImage
+          archive: false
