@@ -20,6 +20,19 @@ on:
         required: false
         default: true
         type: boolean
+      publish_release:
+        description: '构建后发布到 GitHub Release（Release 才能用镜像加速下载）'
+        required: false
+        default: true
+        type: boolean
+      release_tag:
+        description: 'Release 的 tag 名（默认 appimage-aarch64-<版本>）'
+        required: false
+        default: ''
+      gh_proxy:
+        description: 'GitHub 加速前缀（仅加速构建时的下载），如 https://ghfast.top/ 或 https://gh-proxy.com/'
+        required: false
+        default: ''
   push:
     tags: ['v*']
 
@@ -40,7 +53,7 @@ jobs:
     name: Build AppImage (aarch64)
     runs-on: ubuntu-24.04-arm
     permissions:
-      contents: read
+      contents: write   # 发布 Release 需要写权限
 
     steps:
       - name: 环境信息
@@ -119,7 +132,7 @@ jobs:
         id: miniaudio
         run: |
           set -e
-          url="https://raw.githubusercontent.com/mackron/miniaudio/${MINIAUDIO_VERSION}/miniaudio.h"
+          url="${{ inputs.gh_proxy }}https://raw.githubusercontent.com/mackron/miniaudio/${MINIAUDIO_VERSION}/miniaudio.h"
           if curl -fsSL -o src/miniaudio.h "$url" \
              && ! head -c 200 src/miniaudio.h | grep -qi '<html\|404'; then
             echo "miniaudio 下载成功"; echo "ok=true" >> "$GITHUB_OUTPUT"
@@ -189,10 +202,17 @@ jobs:
           base_ld="https://github.com/linuxdeploy/linuxdeploy/releases/download/${LINUXDEPLOY_VERSION}"
           base_qt="https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/${LINUXDEPLOY_PLUGIN_VERSION}"
 
-          wget -q -O "$dest/linuxdeploy.bin"                 "$base_ld/linuxdeploy-aarch64.AppImage"
-          wget -q -O "$dest/linuxdeploy-plugin-qt.bin"       "$base_qt/linuxdeploy-plugin-qt-aarch64.AppImage"
-          wget -q -O "$dest/appimagetool.bin"                "$APPIMAGETOOL_URL"
+          proxy="${{ inputs.gh_proxy }}"
+          [ -n "$proxy" ] && echo "使用加速前缀: $proxy"
+          wget -q -O "$dest/linuxdeploy.bin"                 "${proxy}${base_ld}/linuxdeploy-aarch64.AppImage"
+          wget -q -O "$dest/linuxdeploy-plugin-qt.bin"       "${proxy}${base_qt}/linuxdeploy-plugin-qt-aarch64.AppImage"
+          wget -q -O "$dest/appimagetool.bin"                "${proxy}${APPIMAGETOOL_URL}"
           chmod +x "$dest"/*.bin
+          # 校验确实下载到了 AppImage（HTML 错误页会导致后续莫名其妙的失败）
+          for f in "$dest"/*.bin; do
+            file "$f" | grep -qi 'ELF\|executable' \
+              || { echo "::error::$f 不是有效可执行文件，下载可能被代理拦下了"; head -c 200 "$f"; exit 1; }
+          done
 
           # 无 FUSE 时改为 --appimage-extract-and-run 包装运行
           if [ -e /dev/fuse ] && "$dest/linuxdeploy.bin" --help >/dev/null 2>&1; then
@@ -396,6 +416,36 @@ jobs:
           name: CopyQ-aarch64-AppImage
           path: CopyQ-*.AppImage
           archive: false
+
+      - name: 发布到 GitHub Release（可用镜像加速下载）
+        if: inputs.publish_release && steps.package.outputs.name != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          appimage="${{ steps.package.outputs.name }}"
+          version="${{ steps.version.outputs.version }}"
+          tag="${{ inputs.release_tag }}"
+          [ -n "$tag" ] || tag="appimage-aarch64-$version"
+          echo "发布到 tag: $tag"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$appimage" --clobber
+          else
+            gh release create "$tag" "$appimage" \
+              --target "$GITHUB_SHA" \
+              --title "CopyQ $version (aarch64 AppImage)" \
+              --notes "由 GitHub Actions 自动构建的 aarch64 AppImage，源码版本 \`$version\`。"
+          fi
+
+          url="$(gh release view "$tag" --json url --jq '.url')"
+          echo "### ✅ 已发布" >> "$GITHUB_STEP_SUMMARY"
+          echo "Release： $url" >> "$GITHUB_STEP_SUMMARY"
+          echo ""
+          echo "下载直链见上方 Release 页面，可配合 gh-proxy 等镜像加速。"
+          echo "已发布: $url"
 
       - name: 上传日志（始终）
         if: always()
