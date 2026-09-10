@@ -1,7 +1,7 @@
 name: CopyQ AppImage (aarch64)
 
 # 在 GitHub 官方 ARM64 runner 上原生构建 CopyQ 的 aarch64 AppImage。
-# 用法：Actions -> 本工作流 -> Run workflow（可指定 ref，默认 v16.0.0）
+# 打包拆成两步（linuxdeploy 生成 AppDir -> appimagetool 打包），便于定位失败点。
 
 on:
   workflow_dispatch:
@@ -15,6 +15,11 @@ on:
         required: false
         default: false
         type: boolean
+      debug:
+        description: '开启详细日志'
+        required: false
+        default: true
+        type: boolean
   push:
     tags: ['v*']
 
@@ -23,35 +28,39 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # linuxdeploy 工具链：这三个仓库都提供官方 aarch64 AppImage
   LINUXDEPLOY_VERSION: '1-alpha-20251107-1'
   LINUXDEPLOY_PLUGIN_VERSION: '1-alpha-20250213-1'
   MINIAUDIO_VERSION: '0.11.25'
+  APPIMAGETOOL_URL: 'https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-aarch64.AppImage'
 
 jobs:
   build:
     name: Build AppImage (aarch64)
-    # GitHub 官方 ARM64 runner。公开仓库免费且不限时长；私有仓库也可用（2026-01 起），但消耗额度。
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
 
     steps:
+      - name: 环境信息
+        run: |
+          uname -m
+          lsb_release -a || true
+          nproc
+          df -h / /tmp || true
+          ls -l /dev/fuse || echo "（无 /dev/fuse）"
+
       - name: 检出源码
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
         with:
-          # 若把这个 workflow 放在任意空仓库里（非 CopyQ 的 fork），
-          # 取消下面这行的注释即可直接构建上游源码：
+          # 放在非 fork 的空仓库时，取消注释可直接构建上游源码：
           # repository: hluk/CopyQ
-          # 注意：这里故意不指定 ref。fork 仓库不会复制上游 tag，
-          # 直接 checkout v16.0.0 会报 "A branch or tag ... could not be found"。
-          # 改为先检出默认分支，下一步补齐 tag 后再切换。
-          fetch-depth: 0      # CMake 用 git describe 生成版本串，需要完整历史
+          # 故意不指定 ref：fork 不复制上游 tag，直接 checkout v16.0.0 会失败
+          fetch-depth: 0
           filter: blob:none
           submodules: false
           persist-credentials: false
 
-      - name: 补齐上游 tag 并切换到目标版本
+      - name: 补齐上游 tag 并切换目标版本
         env:
           TARGET_REF: ${{ inputs.ref || github.ref_name }}
         run: |
@@ -59,18 +68,13 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git remote add upstream https://github.com/hluk/CopyQ.git 2>/dev/null || true
           git fetch --tags --force upstream 'refs/tags/*:refs/tags/*' \
-            || echo "::warning::拉取上游 tag 失败，将只用本地 ref"
-
+            || echo "::warning::拉取上游 tag 失败，只用本地 ref"
           if git rev-parse --verify --quiet "refs/tags/$TARGET_REF" >/dev/null; then
-            echo "切换到 tag: $TARGET_REF"
             git checkout --force "refs/tags/$TARGET_REF"
           else
-            echo "切换到 ref: $TARGET_REF"
             git checkout --force "$TARGET_REF"
           fi
-
-          echo -n "版本串: "
-          git describe --tags --always
+          echo -n "版本串: "; git describe --tags --always
 
       - name: 开启 ccache
         uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03 # v1.2.23
@@ -83,30 +87,89 @@ jobs:
         run: |
           set -e
           for i in 1 2 3 4; do sudo apt-get update -y && break; sleep 15; done
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build extra-cmake-modules git pkg-config \
-            libxfixes-dev libxtst-dev libwayland-dev libegl-dev \
-            qt6-base-dev qt6-base-dev-tools qt6-base-private-dev \
-            qt6-tools-dev qt6-tools-dev-tools qt6-l10n-tools qt6-declarative-dev \
-            libqt6svg6-dev libqt6svg6 libqt6waylandclient6 \
-            qt6-wayland qt6-wayland-dev qt6-wayland-dev-tools \
-            libqca-qt6-dev libqca-qt6-2 libqca-qt6-plugins \
-            qtkeychain-qt6-dev \
-            wget ca-certificates libfuse2t64 file xvfb
-          ${{ inputs.with_native_notifications && 'sudo apt-get install -y --no-install-recommends libkf6notifications-dev kf6-kstatusnotifieritem-dev libkf6guiaddons-dev' || 'echo "跳过 KF6 包（原生通知关闭）"' }}
 
-      - name: 下载 miniaudio 单头文件
+          required="
+            build-essential cmake ninja-build pkg-config
+            extra-cmake-modules libxfixes-dev libxtst-dev libwayland-dev
+            qt6-base-dev qt6-base-dev-tools qt6-base-private-dev
+            qt6-tools-dev qt6-tools-dev-tools qt6-l10n-tools qt6-declarative-dev
+            libqt6svg6-dev libqt6svg6
+            qtkeychain-qt6-dev
+            wget curl ca-certificates file
+          "
+          optional="
+            libegl-dev
+            libqt6waylandclient6 qt6-wayland qt6-wayland-dev qt6-wayland-dev-tools
+            libqca-qt6-dev libqca-qt6-2 libqca-qt6-plugins
+            libfuse2t64 xvfb
+          "
+
+          echo "=== 必需包 ==="
+          sudo apt-get install -y --no-install-recommends $required
+          echo "=== 可选包（逐个，失败仅警告）==="
+          for p in $optional; do
+            sudo apt-get install -y --no-install-recommends "$p" \
+              || echo "::warning::可选包 $p 安装失败，跳过"
+          done
+
+      - name: 下载 miniaudio（失败则关闭音频功能）
+        id: miniaudio
         run: |
-          curl -sSLo src/miniaudio.h \
-            "https://raw.githubusercontent.com/mackron/miniaudio/${MINIAUDIO_VERSION}/miniaudio.h"
-          ls -l src/miniaudio.h
+          set -e
+          url="https://raw.githubusercontent.com/mackron/miniaudio/${MINIAUDIO_VERSION}/miniaudio.h"
+          if curl -fsSL -o src/miniaudio.h "$url" \
+             && ! head -c 200 src/miniaudio.h | grep -qi '<html\|404'; then
+            echo "miniaudio 下载成功"; echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::miniaudio 下载失败，将 -DWITH_AUDIO=OFF"
+            rm -f src/miniaudio.h
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: 配置并编译
         run: |
-          cmake --preset AppImage-Release \
-            -DCMAKE_CXX_COMPILER=g++ \
-            -DWITH_NATIVE_NOTIFICATIONS=${{ inputs.with_native_notifications && 'ON' || 'OFF' }}
-          cmake --build --preset AppImage-Release
+          set -eo pipefail
+          ${{ inputs.debug && 'set -x' || '' }}
+          audio_flag="${{ steps.miniaudio.outputs.ok == 'true' && '-DWITH_AUDIO=ON' || '-DWITH_AUDIO=OFF' }}"
+          cmake -G Ninja -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DWITH_APPIMAGE=ON \
+            -DWITH_TESTS=OFF \
+            -DWITH_NATIVE_NOTIFICATIONS=${{ inputs.with_native_notifications && 'ON' || 'OFF' }} \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            $audio_flag
+          cmake --build build --parallel "$(nproc)"
+
+      - name: 安装到 AppDir
+        run: |
+          set -e
+          DESTDIR="$GITHUB_WORKSPACE/AppDir" cmake --install build
+
+      - name: 预检 AppDir
+        id: precheck
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          echo "=== AppDir 顶层 ==="
+          ls -la AppDir || { echo "::error::AppDir 不存在"; exit 1; }
+
+          echo "=== usr/bin ==="
+          ls -la AppDir/usr/bin | head -n 20
+          [ -x AppDir/usr/bin/copyq ] || { echo "::error::AppDir/usr/bin/copyq 缺失"; exit 1; }
+
+          echo "=== applications 目录 ==="
+          ls -la AppDir/usr/share/applications || echo "（缺失）"
+          desktop="$(find AppDir/usr/share/applications -name '*.desktop' 2>/dev/null | head -n1)"
+          [ -n "$desktop" ] || { echo "::error::找不到 .desktop 文件"; exit 1; }
+          echo "desktop=$desktop" >> "$GITHUB_OUTPUT"
+
+          icon="$(find AppDir/usr/share/icons -name 'copyq*.svg' -o -name 'copyq*.png' 2>/dev/null | head -n1)"
+          if [ -n "$icon" ]; then echo "icon=$icon" >> "$GITHUB_OUTPUT"; fi
+
+          echo "desktop 文件: $desktop"
+          echo "图标文件: ${icon:-（未找到，跳过图标参数）}"
 
       - name: 取得版本号
         id: version
@@ -115,38 +178,54 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "构建版本: $version"
 
-      - name: 准备 linuxdeploy 工具链（aarch64）
+      - name: 准备打包工具链（aarch64，FUSE 自动兜底）
         run: |
           set -e
           dest="$HOME/.local/bin"
           mkdir -p "$dest"
           base_ld="https://github.com/linuxdeploy/linuxdeploy/releases/download/${LINUXDEPLOY_VERSION}"
           base_qt="https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/${LINUXDEPLOY_PLUGIN_VERSION}"
-          base_ai="https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/${LINUXDEPLOY_PLUGIN_VERSION}"
 
-          wget -q -O "$dest/linuxdeploy"              "$base_ld/linuxdeploy-aarch64.AppImage"
-          wget -q -O "$dest/linuxdeploy-plugin-qt"    "$base_qt/linuxdeploy-plugin-qt-aarch64.AppImage"
-          wget -q -O "$dest/linuxdeploy-plugin-appimage" "$base_ai/linuxdeploy-plugin-appimage-aarch64.AppImage"
+          wget -q -O "$dest/linuxdeploy.bin"                 "$base_ld/linuxdeploy-aarch64.AppImage"
+          wget -q -O "$dest/linuxdeploy-plugin-qt.bin"       "$base_qt/linuxdeploy-plugin-qt-aarch64.AppImage"
+          wget -q -O "$dest/appimagetool.bin"                "$APPIMAGETOOL_URL"
+          chmod +x "$dest"/*.bin
 
-          chmod +x "$dest"/linuxdeploy*
+          # 无 FUSE 时改为 --appimage-extract-and-run 包装运行
+          if [ -e /dev/fuse ] && "$dest/linuxdeploy.bin" --help >/dev/null 2>&1; then
+            echo "AppImage 可直接运行（检测到 FUSE）"
+            for t in linuxdeploy linuxdeploy-plugin-qt appimagetool; do
+              mv "$dest/$t.bin" "$dest/$t"
+            done
+          else
+            echo "::warning::无可用 FUSE，改用 --appimage-extract-and-run 包装"
+            for t in linuxdeploy linuxdeploy-plugin-qt appimagetool; do
+              printf '#!/bin/sh\nexec "%s/%s.bin" --appimage-extract-and-run "$@"\n' "$dest" "$t" > "$dest/$t"
+              chmod +x "$dest/$t"
+            done
+          fi
+
           echo "$dest" >> "$GITHUB_PATH"
+          command -v linuxdeploy && command -v appimagetool
 
-          # 兜底：runner 内核若不支持 FUSE 挂载，直接解包运行
-          echo "APPIMAGE_EXTRACT_AND_RUN=1" >> "$GITHUB_ENV"
-
-      - name: 打包 AppImage
+      - name: 生成 AppDir（linuxdeploy + Qt 插件）
         env:
-          DESTDIR: ${{ github.workspace }}/AppDir
           EXTRA_QT_MODULES: svg;tls
           EXTRA_PLATFORM_PLUGINS: libqwayland.so
           QMAKE: qmake6
           VERSION: ${{ steps.version.outputs.version }}
+          DEBUG: '1'
         run: |
-          set -e
-          DESTDIR="$DESTDIR" cmake --install build/copyq/AppImage-Release
+          set -eo pipefail
+          ${{ inputs.debug && 'set -x' || '' }}
+          cd "$GITHUB_WORKSPACE"
 
-          # linuxdeploy-plugin-qt 不会自动识别的插件目录，手动塞进去
+          command -v linuxdeploy || { echo "::error::linuxdeploy 不在 PATH"; exit 1; }
+          command -v qmake6     || { echo "::error::qmake6 不在 PATH"; exit 1; }
+
           qt_plugins="$(qmake6 -query QT_INSTALL_PLUGINS)"
+          echo "Qt 插件目录: $qt_plugins"
+
           deps_only_flags=()
           for dir in \
               kf6/kwindowsystem \
@@ -154,54 +233,77 @@ jobs:
               wayland-decoration-client \
               wayland-graphics-integration-client \
           ; do
-              src="$qt_plugins/$dir"
-              dst="$DESTDIR/usr/plugins/$dir"
+              src="$qt_plugins/$dir"; dst="AppDir/usr/plugins/$dir"
               if [ -d "$src" ]; then
-                  mkdir -p "$dst"
-                  cp -a "$src"/*.so "$dst/"
+                  mkdir -p "$dst"; cp -a "$src"/*.so "$dst/" 2>/dev/null || true
                   deps_only_flags+=(--deploy-deps-only "$dst")
               fi
           done
 
-          # QCA ossl 插件（标签页加密用）
-          mkdir -p "$DESTDIR/usr/plugins/crypto"
+          mkdir -p AppDir/usr/plugins/crypto
           qca_ossl=$(find /usr/lib /usr/lib64 /usr/lib/aarch64-linux-gnu \
               -name 'libqca-ossl.so' -print -quit 2>/dev/null)
-          if [ -z "$qca_ossl" ]; then
-              echo "::warning::未找到 libqca-ossl.so（加密标签功能可能不可用）"
+          if [ -n "$qca_ossl" ]; then
+              cp -a "$qca_ossl" AppDir/usr/plugins/crypto/
+              deps_only_flags+=(--deploy-deps-only AppDir/usr/plugins/crypto)
           else
-              echo "找到 QCA ossl 插件: $qca_ossl"
-              cp -a "$qca_ossl" "$DESTDIR/usr/plugins/crypto/"
-              deps_only_flags+=(--deploy-deps-only "$DESTDIR/usr/plugins/crypto")
+              echo "::warning::未找到 libqca-ossl.so，加密标签功能可能不可用"
           fi
 
-          linuxdeploy --appdir "$DESTDIR" \
-            --desktop-file "$DESTDIR/usr/share/applications/com.github.hluk.copyq.desktop" \
-            --icon-file "$DESTDIR/usr/share/icons/hicolor/scalable/apps/copyq.svg" \
-            --executable "$DESTDIR/usr/bin/copyq" \
+          icon="${{ steps.precheck.outputs.icon }}"
+          linuxdeploy --appdir AppDir \
+            --desktop-file "${{ steps.precheck.outputs.desktop }}" \
+            ${icon:+--icon-file "$icon"} \
+            --executable AppDir/usr/bin/copyq \
             "${deps_only_flags[@]}" \
-            --plugin qt \
-            --output appimage
+            --plugin qt 2>&1 | tee linuxdeploy.log
+          echo "--- AppDir 生成后 ---"
+          ls -la AppDir
 
-      - name: 校验产物
-        id: artifact
+      - name: 打包成 AppImage（appimagetool）
+        id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ARCH: aarch64
         run: |
-          set -e
-          appimage="$(ls CopyQ-*-aarch64.AppImage | head -n1)"
-          file "$appimage"
-          du -h "$appimage"
-          echo "name=$appimage" >> "$GITHUB_OUTPUT"
+          set -eo pipefail
+          cd "$GITHUB_WORKSPACE"
+          echo "=== AppDir 顶层（打包前）==="; ls -la AppDir
+          [ -f AppDir/AppRun ] || echo "::warning::AppDir/AppRun 不存在"
+          out="CopyQ-${VERSION}-aarch64.AppImage"
+          if ! appimagetool AppDir "$out" 2>&1 | tee appimagetool.log; then
+            echo "::error::appimagetool 打包失败"
+            echo "--- AppRun ---"; ls -la AppDir/AppRun 2>/dev/null || echo "AppRun 缺失"
+            echo "--- .DirIcon ---"; ls -la AppDir/.DirIcon 2>/dev/null || echo ".DirIcon 缺失"
+            echo "--- desktop ---"; ls -la AppDir/*.desktop 2>/dev/null || echo "根目录 desktop 缺失"
+            echo "--- 磁盘 ---"; df -h / /tmp
+            exit 1
+          fi
+          ls -la "$out"
+          echo "name=$out" >> "$GITHUB_OUTPUT"
 
       - name: 冒烟测试
         continue-on-error: true
         run: |
-          chmod +x "${{ steps.artifact.outputs.name }}"
-          xvfb-run -a "./${{ steps.artifact.outputs.name }}" --version || \
-            "./${{ steps.artifact.outputs.name }}" --version
+          cd "$GITHUB_WORKSPACE"
+          chmod +x "${{ steps.package.outputs.name }}"
+          xvfb-run -a "./${{ steps.package.outputs.name }}" --version \
+            || "./${{ steps.package.outputs.name }}" --version
 
-      - name: 上传产物
+      - name: 上传 AppImage
+        if: success()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: CopyQ-aarch64-AppImage
           path: CopyQ-*.AppImage
           archive: false
+
+      - name: 上传日志（始终）
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-logs
+          path: |
+            linuxdeploy.log
+            appimagetool.log
+          if-no-files-found: ignore
