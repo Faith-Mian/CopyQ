@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: 'CopyQ 源码 tag / 分支 / commit'
+        description: 'tag / 分支名 / commit SHA'
         required: true
         default: 'v16.0.0'
       with_native_notifications:
@@ -43,11 +43,34 @@ jobs:
           # 若把这个 workflow 放在任意空仓库里（非 CopyQ 的 fork），
           # 取消下面这行的注释即可直接构建上游源码：
           # repository: hluk/CopyQ
-          ref: ${{ inputs.ref || github.ref_name }}
+          # 注意：这里故意不指定 ref。fork 仓库不会复制上游 tag，
+          # 直接 checkout v16.0.0 会报 "A branch or tag ... could not be found"。
+          # 改为先检出默认分支，下一步补齐 tag 后再切换。
           fetch-depth: 0      # CMake 用 git describe 生成版本串，需要完整历史
           filter: blob:none
           submodules: false
           persist-credentials: false
+
+      - name: 补齐上游 tag 并切换到目标版本
+        env:
+          TARGET_REF: ${{ inputs.ref || github.ref_name }}
+        run: |
+          set -e
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git remote add upstream https://github.com/hluk/CopyQ.git 2>/dev/null || true
+          git fetch --tags --force upstream 'refs/tags/*:refs/tags/*' \
+            || echo "::warning::拉取上游 tag 失败，将只用本地 ref"
+
+          if git rev-parse --verify --quiet "refs/tags/$TARGET_REF" >/dev/null; then
+            echo "切换到 tag: $TARGET_REF"
+            git checkout --force "refs/tags/$TARGET_REF"
+          else
+            echo "切换到 ref: $TARGET_REF"
+            git checkout --force "$TARGET_REF"
+          fi
+
+          echo -n "版本串: "
+          git describe --tags --always
 
       - name: 开启 ccache
         uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03 # v1.2.23
