@@ -36,6 +36,10 @@ jobs:
           wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/1-alpha-20250213-1/linuxdeploy-plugin-appimage-aarch64.AppImage -O linuxdeploy-plugin-appimage
           chmod +x linuxdeploy*
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      
+      # 下载 miniaudio.h（音频提示功能依赖，官方 CI 有此步骤）
+      - name: Download miniaudio
+        uses: ./.github/actions/download-miniaudio
 
       - name: Build with CMake
         run: |
