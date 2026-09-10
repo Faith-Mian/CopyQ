@@ -28,7 +28,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  LINUXDEPLOY_VERSION: '1-alpha-20251107-1'
+  # 必须与 plugin 版本同批次（官方 CopyQ workflow 用的就是 20250213 这一批）。
+  # 主程序用更新的 2025xxxx 而 plugin 停留在 20250213 会因版本错配失败。
+  LINUXDEPLOY_VERSION: '1-alpha-20250213-2'
   LINUXDEPLOY_PLUGIN_VERSION: '1-alpha-20250213-1'
   MINIAUDIO_VERSION: '0.11.25'
   APPIMAGETOOL_URL: 'https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-aarch64.AppImage'
@@ -209,6 +211,7 @@ jobs:
           command -v linuxdeploy && command -v appimagetool
 
       - name: 生成 AppDir（linuxdeploy + Qt 插件）
+        id: deploy
         env:
           EXTRA_QT_MODULES: svg;tls
           EXTRA_PLATFORM_PLUGINS: libqwayland.so
@@ -218,10 +221,12 @@ jobs:
         run: |
           set -eo pipefail
           ${{ inputs.debug && 'set -x' || '' }}
-          cd "$GITHUB_WORKSPACE"
+          APPDIR="$GITHUB_WORKSPACE/AppDir"
 
           command -v linuxdeploy || { echo "::error::linuxdeploy 不在 PATH"; exit 1; }
-          command -v qmake6     || { echo "::error::qmake6 不在 PATH"; exit 1; }
+          command -v linuxdeploy-plugin-qt || { echo "::error::linuxdeploy-plugin-qt 不在 PATH"; exit 1; }
+          command -v qmake6 || { echo "::error::qmake6 不在 PATH"; exit 1; }
+          linuxdeploy --version || true
 
           qt_plugins="$(qmake6 -query QT_INSTALL_PLUGINS)"
           echo "Qt 插件目录: $qt_plugins"
@@ -233,35 +238,102 @@ jobs:
               wayland-decoration-client \
               wayland-graphics-integration-client \
           ; do
-              src="$qt_plugins/$dir"; dst="AppDir/usr/plugins/$dir"
+              src="$qt_plugins/$dir"; dst="$APPDIR/usr/plugins/$dir"
               if [ -d "$src" ]; then
                   mkdir -p "$dst"; cp -a "$src"/*.so "$dst/" 2>/dev/null || true
                   deps_only_flags+=(--deploy-deps-only "$dst")
               fi
           done
 
-          mkdir -p AppDir/usr/plugins/crypto
+          mkdir -p "$APPDIR/usr/plugins/crypto"
           qca_ossl=$(find /usr/lib /usr/lib64 /usr/lib/aarch64-linux-gnu \
               -name 'libqca-ossl.so' -print -quit 2>/dev/null)
           if [ -n "$qca_ossl" ]; then
-              cp -a "$qca_ossl" AppDir/usr/plugins/crypto/
-              deps_only_flags+=(--deploy-deps-only AppDir/usr/plugins/crypto)
+              cp -a "$qca_ossl" "$APPDIR/usr/plugins/crypto/"
+              deps_only_flags+=(--deploy-deps-only "$APPDIR/usr/plugins/crypto")
           else
               echo "::warning::未找到 libqca-ossl.so，加密标签功能可能不可用"
           fi
 
           icon="${{ steps.precheck.outputs.icon }}"
-          linuxdeploy --appdir AppDir \
+          if linuxdeploy --appdir "$APPDIR" \
             --desktop-file "${{ steps.precheck.outputs.desktop }}" \
             ${icon:+--icon-file "$icon"} \
-            --executable AppDir/usr/bin/copyq \
+            --executable "$APPDIR/usr/bin/copyq" \
             "${deps_only_flags[@]}" \
-            --plugin qt 2>&1 | tee linuxdeploy.log
+            --plugin qt 2>&1 | tee linuxdeploy.log; then
+            echo "linuxdeploy 成功"
+          else
+            # 日志直接打到页面，无需下载 artifact
+            {
+              echo "### ❌ linuxdeploy 失败"
+              echo ""
+              echo "**linuxdeploy 版本**：$(linuxdeploy --version 2>&1 | head -n1)"
+              echo "**架构**：$(uname -m)"
+              echo ""
+              echo '```'
+              tail -n 80 linuxdeploy.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::linuxdeploy 失败，日志尾部如下："
+            tail -n 80 linuxdeploy.log
+            exit 1
+          fi
           echo "--- AppDir 生成后 ---"
-          ls -la AppDir
+          ls -la "$APPDIR"
+
+      - name: 降级：手动部署 Qt 依赖（仅当上一步失败时）
+        id: fallback
+        if: failure() && steps.deploy.outcome == 'failure'
+        run: |
+          set -eo pipefail
+          APPDIR="$GITHUB_WORKSPACE/AppDir"
+          echo "::warning::--plugin qt 失败，改用手动部署 Qt 依赖"
+
+          linuxdeploy --appdir "$APPDIR" \
+            --desktop-file "${{ steps.precheck.outputs.desktop }}" \
+            --executable "$APPDIR/usr/bin/copyq" 2>&1 | tee linuxdeploy.log
+
+          mkdir -p "$APPDIR/usr/lib" "$APPDIR/usr/plugins"
+          qt_plugins="$(qmake6 -query QT_INSTALL_PLUGINS)"
+
+          for d in platforms imageformats iconengines tls sqldrivers platformthemes \
+                   wayland-shell-integration wayland-decoration-client \
+                   wayland-graphics-integration-client; do
+            if [ -d "$qt_plugins/$d" ]; then cp -a "$qt_plugins/$d" "$APPDIR/usr/plugins/"; fi
+          done
+
+          # 迭代拷贝 Qt/KF6/ICU 依赖
+          for round in 1 2 3; do
+            find "$APPDIR/usr/bin" "$APPDIR/usr/lib" "$APPDIR/usr/plugins" \
+                 "$APPDIR/usr/lib/copyq" -type f 2>/dev/null | while read -r f; do
+              file "$f" | grep -q ELF || continue
+              ldd "$f" 2>/dev/null | grep -o '/[^ ]*\.so[^ ]*' | while read -r lib; do
+                [ -f "$lib" ] || continue
+                case "$lib" in
+                  */libQt6*|*/libqca*|*/libicu*|*/libKF6*|*/libqgpgme*)
+                    dst="$APPDIR/usr/lib/$(basename "$lib")"
+                    [ -e "$dst" ] || cp -a "$lib" "$dst" 2>/dev/null || true
+                    ;;
+                esac
+              done
+            done
+          done
+
+          # 告诉 Qt 去哪儿找插件（AppImage 标准布局）
+          cat > "$APPDIR/usr/bin/qt.conf" <<'EOF'
+          [Paths]
+          Prefix = ..
+          Plugins = plugins
+          Libraries = lib
+          EOF
+
+          echo "Qt 插件："; ls "$APPDIR/usr/plugins"
+          echo "已收集库数量：$(ls "$APPDIR/usr/lib" | wc -l)"
 
       - name: 打包成 AppImage（appimagetool）
         id: package
+        if: steps.deploy.outcome == 'success' || steps.fallback.outcome == 'success'
         env:
           VERSION: ${{ steps.version.outputs.version }}
           ARCH: aarch64
