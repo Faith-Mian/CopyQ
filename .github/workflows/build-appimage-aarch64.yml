@@ -97,11 +97,12 @@ jobs:
             qt6-tools-dev qt6-tools-dev-tools qt6-l10n-tools qt6-declarative-dev
             libqt6svg6-dev libqt6svg6
             qtkeychain-qt6-dev
+            qt6-wayland libqt6waylandclient6
             wget curl ca-certificates file
           "
           optional="
             libegl-dev
-            libqt6waylandclient6 qt6-wayland qt6-wayland-dev qt6-wayland-dev-tools
+            qt6-wayland-dev qt6-wayland-dev-tools
             libqca-qt6-dev libqca-qt6-2 libqca-qt6-plugins
             libfuse2t64 xvfb
           "
@@ -214,7 +215,10 @@ jobs:
         id: deploy
         env:
           EXTRA_QT_MODULES: svg;tls
-          EXTRA_PLATFORM_PLUGINS: libqwayland.so
+          # 注意：不要再写死 libqwayland.so —— Qt6 已拆分为
+          # libqwayland-generic.so / libqwayland-egl.so，写死会导致
+          # "Cannot deploy non-existing library file" 并 exit 1。
+          # 实际值在下方按文件名自动探测后 export。
           QMAKE: qmake6
           VERSION: ${{ steps.version.outputs.version }}
           DEBUG: '1'
@@ -230,6 +234,20 @@ jobs:
 
           qt_plugins="$(qmake6 -query QT_INSTALL_PLUGINS)"
           echo "Qt 插件目录: $qt_plugins"
+          echo "platforms 目录内容:"; ls "$qt_plugins/platforms"
+
+          # 自动探测 wayland 平台插件真实文件名（Qt6 不再有 libqwayland.so）
+          wayland_plugins=""
+          for so in "$qt_plugins"/platforms/libqwayland*.so; do
+            [ -e "$so" ] || continue
+            wayland_plugins="${wayland_plugins:+$wayland_plugins;}$(basename "$so")"
+          done
+          if [ -n "$wayland_plugins" ]; then
+            export EXTRA_PLATFORM_PLUGINS="$wayland_plugins"
+            echo "额外平台插件: $EXTRA_PLATFORM_PLUGINS"
+          else
+            echo "::warning::未找到 wayland 平台插件，跳过（AppImage 将只用 X11/XWayland）"
+          fi
 
           deps_only_flags=()
           for dir in \
@@ -290,9 +308,11 @@ jobs:
           APPDIR="$GITHUB_WORKSPACE/AppDir"
           echo "::warning::--plugin qt 失败，改用手动部署 Qt 依赖"
 
-          linuxdeploy --appdir "$APPDIR" \
+          if ! linuxdeploy --appdir "$APPDIR" \
             --desktop-file "${{ steps.precheck.outputs.desktop }}" \
-            --executable "$APPDIR/usr/bin/copyq" 2>&1 | tee linuxdeploy.log
+            --executable "$APPDIR/usr/bin/copyq" 2>&1 | tee linuxdeploy.log; then
+            echo "::warning::linuxdeploy 基础部署也失败了，继续手动补齐"
+          fi
 
           mkdir -p "$APPDIR/usr/lib" "$APPDIR/usr/plugins"
           qt_plugins="$(qmake6 -query QT_INSTALL_PLUGINS)"
@@ -300,15 +320,24 @@ jobs:
           for d in platforms imageformats iconengines tls sqldrivers platformthemes \
                    wayland-shell-integration wayland-decoration-client \
                    wayland-graphics-integration-client; do
-            if [ -d "$qt_plugins/$d" ]; then cp -a "$qt_plugins/$d" "$APPDIR/usr/plugins/"; fi
+            if [ -d "$qt_plugins/$d" ]; then cp -a "$qt_plugins/$d" "$APPDIR/usr/plugins/" || true; fi
           done
 
-          # 迭代拷贝 Qt/KF6/ICU 依赖
+          # 迭代拷贝 Qt/KF6/ICU 依赖。
+          # 注意：先把清单落盘再用 while 读，避免 `ldd | grep` 无匹配时
+          # 在 set -eo pipefail 下直接中断。
           for round in 1 2 3; do
-            find "$APPDIR/usr/bin" "$APPDIR/usr/lib" "$APPDIR/usr/plugins" \
-                 "$APPDIR/usr/lib/copyq" -type f 2>/dev/null | while read -r f; do
+            : > /tmp/elf.list
+            for base in "$APPDIR/usr/bin" "$APPDIR/usr/lib" "$APPDIR/usr/plugins"; do
+              [ -d "$base" ] || continue
+              find "$base" -type f -print >> /tmp/elf.list 2>/dev/null || true
+            done
+            while read -r f; do
+              [ -f "$f" ] || continue
               file "$f" | grep -q ELF || continue
-              ldd "$f" 2>/dev/null | grep -o '/[^ ]*\.so[^ ]*' | while read -r lib; do
+              ldd "$f" > /tmp/ldd.txt 2>/dev/null || true
+              grep -o '/[^ ]*\.so[^ ]*' /tmp/ldd.txt > /tmp/libs.txt || true
+              while read -r lib; do
                 [ -f "$lib" ] || continue
                 case "$lib" in
                   */libQt6*|*/libqca*|*/libicu*|*/libKF6*|*/libqgpgme*)
@@ -316,17 +345,15 @@ jobs:
                     [ -e "$dst" ] || cp -a "$lib" "$dst" 2>/dev/null || true
                     ;;
                 esac
-              done
-            done
+              done < /tmp/libs.txt
+            done < /tmp/elf.list
           done
 
-          # 告诉 Qt 去哪儿找插件（AppImage 标准布局）
-          cat > "$APPDIR/usr/bin/qt.conf" <<'EOF'
-          [Paths]
-          Prefix = ..
-          Plugins = plugins
-          Libraries = lib
-          EOF
+          # 告诉 Qt 去哪儿找插件（AppImage 标准布局）。
+          # 用 printf 而非 heredoc：YAML 缩进会污染 heredoc 内容导致 INI 解析失败。
+          printf '[Paths]\nPrefix = ..\nPlugins = plugins\nLibraries = lib\n' \
+            > "$APPDIR/usr/bin/qt.conf"
+          cat "$APPDIR/usr/bin/qt.conf"
 
           echo "Qt 插件："; ls "$APPDIR/usr/plugins"
           echo "已收集库数量：$(ls "$APPDIR/usr/lib" | wc -l)"
