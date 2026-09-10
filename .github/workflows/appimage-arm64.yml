@@ -1,0 +1,89 @@
+name: AppImage (ARM64)
+
+on:
+  workflow_dispatch:   # 允许手动触发
+
+jobs:
+  appimage-arm64:
+    runs-on: ubuntu-24.04-arm   # GitHub 免费 ARM64 云主机
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            g++ ninja-build cmake \
+            libxfixes-dev libxtst-dev extra-cmake-modules \
+            libwayland-dev libegl-dev \
+            qt6-base-private-dev qt6-base-dev qt6-base-dev-tools \
+            qt6-tools-dev qt6-tools-dev-tools qt6-l10n-tools \
+            qt6-declarative-dev \
+            libqt6svg6-dev libqt6svg6 \
+            libqt6waylandclient6 qt6-wayland qt6-wayland-dev qt6-wayland-dev-tools \
+            libqca-qt6-dev libqca-qt6-2 libqca-qt6-plugins \
+            qtkeychain-qt6-dev \
+            libfuse2t64
+
+      # 关键：官方下载的是 x86_64 工具，这里换成 aarch64 版
+      - name: Set up AppImage tools (aarch64)
+        run: |
+          mkdir -p "$HOME/.local/bin" && cd "$HOME/.local/bin"
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20250213-2/linuxdeploy-aarch64.AppImage -O linuxdeploy
+          wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/1-alpha-20250213-1/linuxdeploy-plugin-qt-aarch64.AppImage -O linuxdeploy-plugin-qt
+          wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/1-alpha-20250213-1/linuxdeploy-plugin-appimage-aarch64.AppImage -O linuxdeploy-plugin-appimage
+          chmod +x linuxdeploy*
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build with CMake
+        run: |
+          cmake --preset 'AppImage-Release' -DCMAKE_CXX_COMPILER=g++ -DWITH_NATIVE_NOTIFICATIONS=OFF
+          cmake --build --preset 'AppImage-Release'
+
+      - name: Get version string
+        id: version
+        uses: ./.github/actions/get-version
+        with:
+          build_dir: ${{ github.workspace }}/build/copyq/AppImage-Release
+
+      # 与官方流程一致，只是把 x86_64 库路径换成 aarch64
+      - name: Create AppImage
+        env:
+          DESTDIR: ${{ github.workspace }}/AppDir
+          EXTRA_QT_MODULES: svg;tls
+          EXTRA_PLATFORM_PLUGINS: libqwayland.so
+          QMAKE: qmake6
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          DESTDIR="$DESTDIR" cmake --install build/copyq/AppImage-Release
+          qt_plugins="$(qmake6 -query QT_INSTALL_PLUGINS)"
+          deps_only_flags=()
+          for dir in kf6/kwindowsystem wayland-shell-integration \
+                     wayland-decoration-client wayland-graphics-integration-client; do
+            src="$qt_plugins/$dir"; dst="$DESTDIR/usr/plugins/$dir"
+            if [ -d "$src" ]; then
+              mkdir -p "$dst"; cp -a "$src"/*.so "$dst/"
+              deps_only_flags+=(--deploy-deps-only "$dst")
+            fi
+          done
+          mkdir -p "$DESTDIR/usr/plugins/crypto"
+          qca_ossl=$(find /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu \
+              -name 'libqca-ossl.so' -print -quit 2>/dev/null)
+          [ -n "$qca_ossl" ] || { echo "::error::libqca-ossl.so not found"; exit 1; }
+          cp -a "$qca_ossl" "$DESTDIR/usr/plugins/crypto/"
+          deps_only_flags+=(--deploy-deps-only "$DESTDIR/usr/plugins/crypto")
+          linuxdeploy --appdir "$DESTDIR" \
+            --desktop-file "$DESTDIR/usr/share/applications/com.github.hluk.copyq.desktop" \
+            --icon-file "$DESTDIR/usr/share/icons/hicolor/scalable/apps/copyq.svg" \
+            --executable "$DESTDIR/usr/bin/copyq" \
+            "${deps_only_flags[@]}" \
+            --plugin qt \
+            --output appimage
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: CopyQ-arm64-AppImage
+          path: CopyQ-*.AppImage
